@@ -12,7 +12,7 @@ from loguru import logger
 
 from .config import config
 from .client import polymarket_client, PolymarketClient
-from .strategies import BaseStrategy, MomentumStrategy, ArbitrageStrategy, ValueStrategy
+from .strategies import BaseStrategy, MomentumStrategy, ArbitrageStrategy, ValueStrategy, BTCArbitrageStrategy
 from .strategies.base import TradeSignal, Signal
 
 
@@ -250,7 +250,7 @@ class TradingBot:
         logger.debug(f"Analyzing {len(markets)} markets...")
 
         # Analyze markets with each strategy
-        for market in markets[:20]:  # Limit to first 20 markets for performance
+        for market in markets[:50]:  # Increased limit for BTC market search
             condition_id = market.get("condition_id")
             if not condition_id:
                 continue
@@ -259,18 +259,27 @@ class TradingBot:
             if not tokens:
                 continue
 
-            # Get orderbook for first token
-            token_id = tokens[0].get("token_id")
-            if not token_id:
-                continue
-
-            orderbook = self.client.get_orderbook(token_id)
-            if not orderbook:
-                continue
-
             # Run strategies
             for strategy in self.strategies:
                 if not strategy.is_active:
+                    continue
+
+                # Special handling for BTC Arbitrage strategy
+                if isinstance(strategy, BTCArbitrageStrategy):
+                    signals = strategy.analyze_with_client(market, self.client)
+                    for signal in signals:
+                        logger.info(f"Signal from {strategy.name}: {signal.signal.value} - {signal.reason}")
+                        if signal.signal == Signal.BUY:
+                            self._execute_signal(signal)
+                    continue
+
+                # Get orderbook for first token
+                token_id = tokens[0].get("token_id")
+                if not token_id:
+                    continue
+
+                orderbook = self.client.get_orderbook(token_id)
+                if not orderbook:
                     continue
 
                 signal = strategy.analyze(market, orderbook)

@@ -5,10 +5,13 @@ Un bot de trading automatique pour les marchés prédictifs Polymarket.
 ## Fonctionnalités
 
 - **Trading automatique** : Achat et vente automatique basés sur des stratégies configurables
+- **Arbitrage BTC** : Stratégie spéciale pour le prix du Bitcoin (achète UP + DOWN)
+- **Dashboard temps réel** : Interface terminal pour suivre positions, P&L, et trades
 - **Multiples stratégies** :
   - **Momentum** : Trade basé sur les tendances de prix
   - **Arbitrage** : Détecte les opportunités d'arbitrage entre YES/NO
   - **Value** : Trading basé sur l'estimation de la valeur réelle
+  - **BTC Arbitrage** : Arbitrage spécialisé sur les marchés BTC 1H
 - **Gestion des risques** :
   - Stop Loss automatique
   - Take Profit automatique
@@ -73,7 +76,28 @@ DRY_RUN=true                  # true = pas de vraies transactions
 
 ## Utilisation
 
-### Démarrer le bot
+### Mode BTC Arbitrage (Recommandé pour débuter)
+
+Le mode BTC arbitrage recherche les marchés de prédiction du prix du Bitcoin sur 1 heure et achète automatiquement les deux côtés (UP et DOWN) quand une opportunité d'arbitrage existe.
+
+```bash
+# Lancer le bot BTC avec dashboard
+python main.py btc
+
+# Options disponibles :
+python main.py btc --min-spread 0.03    # Spread minimum de 3%
+python main.py btc --amount 100          # 100 USDC par côté
+python main.py btc --timeframe 4h        # Marchés 4 heures
+python main.py btc --no-dashboard        # Sans interface graphique
+```
+
+**Comment ça marche :**
+- Si UP coûte 0.45 et DOWN coûte 0.48 → Total = 0.93
+- Le bot achète les deux pour 0.93
+- À l'expiration, un des deux vaudra 1.00
+- Profit garanti = 0.07 (7%)
+
+### Démarrer le bot général
 
 ```bash
 # Démarrer avec les stratégies par défaut (momentum + arbitrage)
@@ -86,14 +110,34 @@ python main.py start --momentum --no-arbitrage
 python main.py start --momentum --arbitrage --value
 ```
 
+### Dashboard en temps réel
+
+```bash
+# Afficher le dashboard sans lancer le bot
+python main.py dashboard
+```
+
+Le dashboard affiche :
+- Balance et P&L de session
+- Statistiques de trading (trades, win rate, etc.)
+- Positions ouvertes avec P&L en temps réel
+- Historique des trades récents
+- Info sur le marché BTC actuel
+
 ### Commandes disponibles
 
 ```bash
 # Voir le statut et les positions
 python main.py status
 
+# Voir l'historique et les statistiques
+python main.py history
+
 # Lister les marchés disponibles
 python main.py markets --limit 20
+
+# Lister uniquement les marchés BTC
+python main.py markets --btc
 
 # Voir le carnet d'ordres d'un token
 python main.py orderbook <TOKEN_ID>
@@ -111,6 +155,12 @@ python main.py cancel-all
 ```
 
 ## Stratégies
+
+### BTC Arbitrage Strategy (Nouveau)
+Stratégie spécialisée pour les marchés de prédiction du prix du Bitcoin :
+- Recherche les marchés BTC 1H/4H/24H
+- Achète simultanément UP et DOWN quand spread > seuil
+- Profit garanti si total < 1
 
 ### Momentum Strategy
 Analyse les mouvements de prix récents et génère des signaux basés sur le momentum :
@@ -132,24 +182,47 @@ Trading basé sur votre estimation de la probabilité réelle :
 
 ```
 bot-polymarket/
-├── main.py              # Point d'entrée CLI
-├── requirements.txt     # Dépendances Python
-├── .env.example         # Template de configuration
+├── main.py                  # Point d'entrée CLI
+├── requirements.txt         # Dépendances Python
+├── .env.example             # Template de configuration
 ├── .gitignore
 ├── README.md
 ├── src/
 │   ├── __init__.py
-│   ├── config.py        # Gestion de la configuration
-│   ├── client.py        # Client API Polymarket
-│   ├── bot.py           # Logique principale du bot
+│   ├── config.py            # Gestion de la configuration
+│   ├── client.py            # Client API Polymarket
+│   ├── bot.py               # Logique principale du bot
+│   ├── dashboard.py         # Interface dashboard temps réel
 │   └── strategies/
 │       ├── __init__.py
-│       ├── base.py      # Classe de base des stratégies
-│       ├── momentum.py  # Stratégie momentum
-│       ├── arbitrage.py # Stratégie arbitrage
-│       └── value.py     # Stratégie value
-├── logs/                # Fichiers de log
-└── data/                # Données persistantes
+│       ├── base.py          # Classe de base des stratégies
+│       ├── momentum.py      # Stratégie momentum
+│       ├── arbitrage.py     # Stratégie arbitrage
+│       ├── value.py         # Stratégie value
+│       └── btc_arbitrage.py # Stratégie arbitrage BTC
+├── logs/                    # Fichiers de log
+└── data/                    # Données persistantes
+```
+
+## Exemple de Dashboard
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Polymarket Trading Bot          Mode: DRY RUN      ● RUNNING   │
+├─────────────────────────────────────────────────────────────────┤
+│ 💰 Balance          │ 📈 Open Positions                        │
+│ ─────────────────── │ ──────────────────────────────────────── │
+│ Balance    $1000.00 │ Market     Entry   Current  P&L    P&L%  │
+│ Session    +$12.50  │ BTC UP...  $0.450  $0.460   +$2   +2.2%  │
+│ Total P&L  +$45.00  │ BTC DOWN.. $0.480  $0.475   -$1   -1.0%  │
+│                     │                                          │
+│ ₿ BTC 1H Market     │ 📜 Recent Trades                         │
+│ ─────────────────── │ ──────────────────────────────────────── │
+│ UP Price   $0.460   │ 14:32:01  BUY   BTC UP    $0.450  $50    │
+│ DOWN Price $0.475   │ 14:32:02  BUY   BTC DOWN  $0.480  $50    │
+│ Total      $0.935   │ 14:15:00  SELL  ETH YES   $0.620  +$8    │
+│ Profit     +6.5%    │                                          │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Avertissements
@@ -158,6 +231,7 @@ bot-polymarket/
 - **Mode test** : Commencez TOUJOURS en mode `DRY_RUN=true` pour tester.
 - **Petits montants** : Commencez avec de petits montants pour comprendre le fonctionnement.
 - **Surveillance** : Surveillez régulièrement votre bot et vos positions.
+- **Arbitrage** : Les opportunités d'arbitrage sont rares et compétitives.
 
 ## Développement
 

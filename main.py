@@ -6,6 +6,7 @@ A bot that automatically buys and sells on Polymarket prediction markets.
 """
 
 import sys
+import threading
 import click
 from loguru import logger
 from rich.console import Console
@@ -14,19 +15,23 @@ from rich.panel import Panel
 
 from src.config import config
 from src.bot import trading_bot
-from src.strategies import MomentumStrategy, ArbitrageStrategy, ValueStrategy
+from src.strategies import MomentumStrategy, ArbitrageStrategy, ValueStrategy, BTCArbitrageStrategy
+from src.dashboard import dashboard
 
 console = Console()
 
 
-def setup_logging():
+def setup_logging(quiet: bool = False):
     """Configure logging."""
     logger.remove()
-    logger.add(
-        sys.stderr,
-        level=config.log_level,
-        format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>"
-    )
+
+    if not quiet:
+        logger.add(
+            sys.stderr,
+            level=config.log_level,
+            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>"
+        )
+
     logger.add(
         "logs/bot_{time:YYYY-MM-DD}.log",
         rotation="1 day",
@@ -38,7 +43,7 @@ def setup_logging():
 @click.group()
 def cli():
     """Polymarket Trading Bot - Automated prediction market trading."""
-    setup_logging()
+    pass
 
 
 @cli.command()
@@ -47,6 +52,8 @@ def cli():
 @click.option("--value/--no-value", default=False, help="Enable value strategy")
 def start(momentum: bool, arbitrage: bool, value: bool):
     """Start the trading bot."""
+    setup_logging()
+
     console.print(Panel.fit(
         "[bold green]Polymarket Trading Bot[/bold green]\n"
         "Automated prediction market trading",
@@ -87,8 +94,82 @@ def start(momentum: bool, arbitrage: bool, value: bool):
 
 
 @cli.command()
+@click.option("--min-spread", default=0.02, help="Minimum spread to trigger trade (e.g., 0.02 = 2%)")
+@click.option("--amount", default=50.0, help="Amount in USDC per side (UP and DOWN)")
+@click.option("--timeframe", default="1h", type=click.Choice(["1h", "4h", "24h"]), help="Target timeframe")
+@click.option("--dashboard/--no-dashboard", default=True, help="Show live dashboard")
+def btc(min_spread: float, amount: float, timeframe: str, dashboard: bool):
+    """
+    Start BTC arbitrage bot.
+
+    This mode focuses on Bitcoin price prediction markets.
+    It buys both UP and DOWN positions when arbitrage opportunity exists.
+    """
+    setup_logging(quiet=dashboard)
+
+    console.print(Panel.fit(
+        "[bold orange1]BTC Arbitrage Bot[/bold orange1]\n"
+        f"Timeframe: {timeframe} | Min Spread: {min_spread*100:.1f}% | Amount: ${amount}/side",
+        border_style="orange1"
+    ))
+
+    # Initialize bot
+    if not trading_bot.initialize():
+        console.print("[bold red]Failed to initialize bot. Check your configuration.[/bold red]")
+        sys.exit(1)
+
+    # Add BTC arbitrage strategy
+    btc_strategy = BTCArbitrageStrategy(
+        min_spread=min_spread,
+        max_position_per_side=amount,
+        target_timeframe=timeframe
+    )
+    trading_bot.add_strategy(btc_strategy)
+
+    # Display status
+    status = trading_bot.get_status()
+    console.print(f"\n[cyan]Balance:[/cyan] ${status['balance']:.2f}" if status['balance'] else "")
+    console.print(f"[cyan]Dry Run:[/cyan] {'Yes' if status['dry_run'] else 'No'}")
+
+    if status['dry_run']:
+        console.print("\n[yellow]Running in DRY RUN mode - no real trades will be executed[/yellow]")
+
+    console.print("\n[green]Starting BTC arbitrage bot... Press Ctrl+C to stop[/green]\n")
+
+    if dashboard:
+        # Run bot in background thread
+        bot_thread = threading.Thread(target=trading_bot.run, daemon=True)
+        bot_thread.start()
+
+        # Run dashboard in main thread
+        from src.dashboard import dashboard as dash
+        dash.run()
+    else:
+        # Run the bot normally
+        trading_bot.run()
+
+
+@cli.command(name="dashboard")
+def show_dashboard():
+    """Show the live trading dashboard."""
+    setup_logging(quiet=True)
+
+    # Initialize bot (but don't run)
+    if not trading_bot.initialize():
+        console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
+        return
+
+    console.print("[cyan]Loading dashboard...[/cyan]")
+
+    from src.dashboard import dashboard as dash
+    dash.run()
+
+
+@cli.command()
 def status():
     """Show bot status and positions."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -142,6 +223,8 @@ def status():
 @click.option("--price", type=float, default=None, help="Limit price (uses market price if not specified)")
 def buy(token_id: str, amount: float, price: float):
     """Manually buy shares of a token."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -162,6 +245,8 @@ def buy(token_id: str, amount: float, price: float):
 @click.option("--price", type=float, default=None, help="Limit price (uses market price if not specified)")
 def sell(token_id: str, size: float, price: float):
     """Manually sell shares of a token."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -178,8 +263,11 @@ def sell(token_id: str, size: float, price: float):
 
 @cli.command()
 @click.option("--limit", default=10, help="Number of markets to show")
-def markets(limit: int):
+@click.option("--btc", is_flag=True, help="Show only BTC markets")
+def markets(limit: int, btc: bool):
     """List available markets."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -187,9 +275,21 @@ def markets(limit: int):
     console.print("[cyan]Fetching markets...[/cyan]\n")
 
     response = trading_bot.client.get_markets()
-    markets_data = response.get("data", [])[:limit]
+    markets_data = response.get("data", [])
 
-    table = Table(title=f"Top {limit} Markets")
+    # Filter for BTC markets if requested
+    if btc:
+        btc_markets = []
+        for market in markets_data:
+            question = market.get("question", "").lower()
+            if "bitcoin" in question or "btc" in question:
+                btc_markets.append(market)
+        markets_data = btc_markets
+        console.print(f"[yellow]Found {len(markets_data)} BTC markets[/yellow]\n")
+
+    markets_data = markets_data[:limit]
+
+    table = Table(title=f"{'BTC ' if btc else ''}Markets (showing {len(markets_data)})")
     table.add_column("Question", style="cyan", max_width=50)
     table.add_column("Condition ID", style="yellow", max_width=20)
     table.add_column("Tokens", style="green")
@@ -207,6 +307,8 @@ def markets(limit: int):
 @click.argument("token_id")
 def orderbook(token_id: str):
     """Show orderbook for a token."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -240,6 +342,8 @@ def orderbook(token_id: str):
 @cli.command()
 def cancel_all():
     """Cancel all open orders."""
+    setup_logging()
+
     if not trading_bot.initialize():
         console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
         return
@@ -249,6 +353,85 @@ def cancel_all():
             console.print("[green]All orders cancelled[/green]")
         else:
             console.print("[red]Failed to cancel orders[/red]")
+
+
+@cli.command()
+def history():
+    """Show trade history and statistics."""
+    setup_logging()
+
+    if not trading_bot.initialize():
+        console.print("[bold red]Failed to initialize. Check configuration.[/bold red]")
+        return
+
+    trades = trading_bot.trade_history
+
+    if not trades:
+        console.print("[yellow]No trade history yet[/yellow]")
+        return
+
+    # Calculate statistics
+    total_trades = len(trades)
+    buys = [t for t in trades if t.get("type") == "BUY"]
+    sells = [t for t in trades if t.get("type") == "SELL"]
+
+    total_pnl = sum(t.get("pnl", 0) for t in sells)
+    winning = [t for t in sells if t.get("pnl", 0) > 0]
+    losing = [t for t in sells if t.get("pnl", 0) < 0]
+
+    win_rate = (len(winning) / len(sells) * 100) if sells else 0
+    avg_win = sum(t.get("pnl", 0) for t in winning) / len(winning) if winning else 0
+    avg_loss = sum(t.get("pnl", 0) for t in losing) / len(losing) if losing else 0
+
+    # Stats table
+    stats_table = Table(title="Trading Statistics")
+    stats_table.add_column("Metric", style="cyan")
+    stats_table.add_column("Value", style="green")
+
+    pnl_style = "green" if total_pnl >= 0 else "red"
+
+    stats_table.add_row("Total Trades", str(total_trades))
+    stats_table.add_row("Buys", str(len(buys)))
+    stats_table.add_row("Sells", str(len(sells)))
+    stats_table.add_row("Winning Trades", f"[green]{len(winning)}[/green]")
+    stats_table.add_row("Losing Trades", f"[red]{len(losing)}[/red]")
+    stats_table.add_row("Win Rate", f"{win_rate:.1f}%")
+    stats_table.add_row("Total P&L", f"[{pnl_style}]${total_pnl:+.2f}[/{pnl_style}]")
+    stats_table.add_row("Avg Win", f"[green]${avg_win:+.2f}[/green]")
+    stats_table.add_row("Avg Loss", f"[red]${avg_loss:+.2f}[/red]")
+
+    console.print(stats_table)
+
+    # Recent trades table
+    console.print("\n")
+    trades_table = Table(title="Recent Trades (Last 20)")
+    trades_table.add_column("Time", style="dim")
+    trades_table.add_column("Type", justify="center")
+    trades_table.add_column("Token", max_width=20)
+    trades_table.add_column("Price", justify="right")
+    trades_table.add_column("Amount/Size", justify="right")
+    trades_table.add_column("P&L", justify="right")
+
+    for trade in trades[-20:]:
+        trade_type = trade.get("type", "")
+        type_style = "green" if trade_type == "BUY" else "red"
+
+        pnl = trade.get("pnl", 0)
+        pnl_str = f"${pnl:+.2f}" if pnl != 0 else "-"
+        pnl_style = "green" if pnl > 0 else "red" if pnl < 0 else "dim"
+
+        time_str = trade.get("time", "")[:19]
+
+        trades_table.add_row(
+            time_str,
+            f"[{type_style}]{trade_type}[/{type_style}]",
+            trade.get("token_id", "")[:16] + "...",
+            f"${trade.get('price', 0):.3f}",
+            f"${trade.get('amount', 0):.2f}" if trade.get('amount') else f"{trade.get('size', 0):.2f}",
+            f"[{pnl_style}]{pnl_str}[/{pnl_style}]"
+        )
+
+    console.print(trades_table)
 
 
 if __name__ == "__main__":
