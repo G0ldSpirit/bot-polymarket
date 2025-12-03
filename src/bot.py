@@ -92,6 +92,15 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Could not save trade history: {e}")
 
+    def _notify_strategies_trade(self, trade: Dict):
+        """Notify all strategies that a trade was executed."""
+        for strategy in self.strategies:
+            if hasattr(strategy, "on_trade_executed"):
+                try:
+                    strategy.on_trade_executed(trade)
+                except Exception as e:
+                    logger.error(f"Error notifying strategy {strategy.name}: {e}")
+
     def _check_stop_loss_take_profit(self) -> List[TradeSignal]:
         """Check positions for stop loss and take profit triggers."""
         signals = []
@@ -176,14 +185,18 @@ class TradingBot:
                     self._save_positions()
 
                     # Save trade
-                    self._save_trade({
+                    trade_record = {
                         "type": "BUY",
                         "token_id": signal.token_id,
                         "price": signal.price,
                         "amount": amount,
                         "time": datetime.now().isoformat(),
                         "reason": signal.reason
-                    })
+                    }
+                    self._save_trade(trade_record)
+
+                    # Notify strategies of executed trade
+                    self._notify_strategies_trade(trade_record)
 
                     logger.success(f"BUY executed: {amount:.2f} USDC @ {signal.price:.3f}")
                     return True
@@ -207,7 +220,7 @@ class TradingBot:
                     pnl = (signal.price - entry_price) * size
 
                     # Save trade
-                    self._save_trade({
+                    trade_record = {
                         "type": "SELL",
                         "token_id": signal.token_id,
                         "price": signal.price,
@@ -215,11 +228,15 @@ class TradingBot:
                         "pnl": pnl,
                         "time": datetime.now().isoformat(),
                         "reason": signal.reason
-                    })
+                    }
+                    self._save_trade(trade_record)
 
                     # Remove position
                     del self.positions[signal.token_id]
                     self._save_positions()
+
+                    # Notify strategies of executed trade
+                    self._notify_strategies_trade(trade_record)
 
                     logger.success(f"SELL executed: {size:.2f} shares @ {signal.price:.3f}, P&L: ${pnl:.2f}")
                     return True

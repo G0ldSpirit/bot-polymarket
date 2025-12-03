@@ -1,9 +1,14 @@
 """
-BTC Arbitrage Strategy - Specialized strategy for Bitcoin price prediction markets.
-Buys both UP and DOWN positions to profit from arbitrage opportunities.
+BTC Arbitrage Strategy - Sequential arbitrage on Bitcoin price prediction markets.
+
+Strategy:
+1. First, buy UP (or the cheaper side)
+2. Wait for prices to move
+3. When spread reaches target profit (e.g., 5%), buy DOWN to lock in arbitrage
 """
 
-import re
+import json
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 from loguru import logger
@@ -13,52 +18,84 @@ from .base import BaseStrategy, TradeSignal, Signal
 
 class BTCArbitrageStrategy(BaseStrategy):
     """
-    BTC Arbitrage Strategy.
+    BTC Sequential Arbitrage Strategy.
 
-    This strategy searches for Bitcoin price prediction markets (1H timeframe)
-    and executes arbitrage by buying both UP and DOWN when their combined
-    price is less than 1.
+    This strategy:
+    1. First buys one side (UP) when price is favorable
+    2. Monitors prices and waits for opportunity
+    3. Buys the other side (DOWN) when combined cost gives target profit
 
-    Example: If UP costs 0.45 and DOWN costs 0.48, total = 0.93
-    Buying both guarantees a profit of 0.07 (7%) regardless of outcome.
+    Example:
+    - Step 1: Buy UP at 0.45
+    - Step 2: Wait... DOWN drops to 0.50
+    - Step 3: Total = 0.95 → 5% profit locked in
     """
 
     def __init__(
         self,
-        min_spread: float = 0.02,
+        target_profit: float = 0.05,
         max_position_per_side: float = 50.0,
-        target_timeframe: str = "1h"
+        target_timeframe: str = "1h",
+        initial_buy_threshold: float = 0.55
     ):
         """
-        Initialize the BTC arbitrage strategy.
+        Initialize the BTC sequential arbitrage strategy.
 
         Args:
-            min_spread: Minimum spread to trigger arbitrage (e.g., 0.02 = 2%)
+            target_profit: Target profit to trigger second buy (e.g., 0.05 = 5%)
             max_position_per_side: Maximum USDC per side (UP or DOWN)
             target_timeframe: Timeframe to target ("1h", "4h", "24h")
+            initial_buy_threshold: Max price to buy first side (e.g., 0.55 = 55 cents)
         """
         super().__init__(name="BTCArbitrageStrategy")
-        self.min_spread = min_spread
+        self.target_profit = target_profit
         self.max_position_per_side = max_position_per_side
         self.target_timeframe = target_timeframe
+        self.initial_buy_threshold = initial_buy_threshold
 
-        # Cache for BTC markets
-        self.btc_markets: List[Dict] = []
-        self.last_market_scan = None
-        self.scan_interval = timedelta(minutes=5)
-
-        # Track our arbitrage positions
-        self.arb_positions: Dict[str, Dict] = {}
+        # Track our position state
+        # State: "waiting" -> "holding_first" -> "completed"
+        self.state = "waiting"
+        self.first_position: Optional[Dict] = None  # {side, token_id, price, amount, time}
 
         # Current market info for dashboard
         self.current_market_info: Optional[Dict] = None
+
+        # Data persistence
+        self.data_file = Path("data/btc_arb_state.json")
+        self._load_state()
+
+    def _load_state(self):
+        """Load saved state from file."""
+        if self.data_file.exists():
+            try:
+                with open(self.data_file) as f:
+                    data = json.load(f)
+                    self.state = data.get("state", "waiting")
+                    self.first_position = data.get("first_position")
+                    logger.info(f"Loaded BTC arb state: {self.state}")
+                    if self.first_position:
+                        logger.info(f"Existing position: {self.first_position['side']} @ {self.first_position['price']}")
+            except Exception as e:
+                logger.warning(f"Could not load state: {e}")
+
+    def _save_state(self):
+        """Save state to file."""
+        self.data_file.parent.mkdir(exist_ok=True)
+        try:
+            with open(self.data_file, "w") as f:
+                json.dump({
+                    "state": self.state,
+                    "first_position": self.first_position
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save state: {e}")
 
     def _is_btc_price_market(self, market: Dict) -> bool:
         """Check if a market is a BTC price prediction market."""
         question = market.get("question", "").lower()
         description = market.get("description", "").lower()
 
-        # Keywords to identify BTC price markets
         btc_keywords = ["bitcoin", "btc"]
         price_keywords = ["price", "above", "below", "over", "under", "reach"]
         timeframe_keywords = {
@@ -67,23 +104,16 @@ class BTCArbitrageStrategy(BaseStrategy):
             "24h": ["24 hour", "24h", "daily", "today"]
         }
 
-        # Check if it's a BTC market
         is_btc = any(kw in question or kw in description for kw in btc_keywords)
         is_price = any(kw in question or kw in description for kw in price_keywords)
 
-        # Check timeframe
         target_kws = timeframe_keywords.get(self.target_timeframe, [])
         is_target_timeframe = any(kw in question or kw in description for kw in target_kws)
 
         return is_btc and is_price and is_target_timeframe
 
     def _get_up_down_tokens(self, market: Dict) -> Optional[Tuple[Dict, Dict]]:
-        """
-        Extract UP and DOWN tokens from a market.
-
-        Returns:
-            Tuple of (up_token, down_token) or None if not found
-        """
+        """Extract UP (YES) and DOWN (NO) tokens from a market."""
         tokens = market.get("tokens", [])
         if len(tokens) != 2:
             return None
@@ -93,8 +123,6 @@ class BTCArbitrageStrategy(BaseStrategy):
 
         for token in tokens:
             outcome = token.get("outcome", "").lower()
-            # Polymarket uses "Yes"/"No" but context determines if it's up or down
-            # Check the question to determine direction
             if outcome == "yes":
                 up_token = token
             elif outcome == "no":
@@ -104,150 +132,17 @@ class BTCArbitrageStrategy(BaseStrategy):
             return (up_token, down_token)
         return None
 
-    def scan_for_btc_markets(self, all_markets: List[Dict]):
-        """Scan all markets to find BTC price markets."""
-        self.btc_markets = []
-
-        for market in all_markets:
-            if self._is_btc_price_market(market):
-                self.btc_markets.append(market)
-                logger.info(f"Found BTC market: {market.get('question', '')[:50]}...")
-
-        self.last_market_scan = datetime.now()
-        logger.info(f"Found {len(self.btc_markets)} BTC price markets")
-
-    def _calculate_arbitrage_opportunity(
-        self,
-        up_price: float,
-        down_price: float
-    ) -> Tuple[bool, float, float]:
-        """
-        Calculate if there's an arbitrage opportunity.
-
-        Args:
-            up_price: Price of UP/YES token
-            down_price: Price of DOWN/NO token
-
-        Returns:
-            Tuple of (is_opportunity, spread, expected_profit_pct)
-        """
-        total_cost = up_price + down_price
-        spread = 1 - total_cost  # Positive spread = profit opportunity
-
-        if total_cost > 0:
-            expected_profit_pct = (spread / total_cost) * 100
-        else:
-            expected_profit_pct = 0
-
-        is_opportunity = spread >= self.min_spread
-
-        return (is_opportunity, spread, expected_profit_pct)
-
     def analyze(self, market: Dict[str, Any], orderbook: Dict[str, Any]) -> Optional[TradeSignal]:
-        """
-        Analyze a market for BTC arbitrage opportunities.
-
-        Note: This method expects orderbook to be a dict keyed by token_id
-        containing orderbooks for both UP and DOWN tokens.
-        """
-        if not self.is_active:
-            return None
-
-        try:
-            # Check if this is a BTC market
-            if not self._is_btc_price_market(market):
-                return None
-
-            # Get UP and DOWN tokens
-            tokens = self._get_up_down_tokens(market)
-            if not tokens:
-                return None
-
-            up_token, down_token = tokens
-            up_id = up_token.get("token_id")
-            down_id = down_token.get("token_id")
-
-            # We need orderbooks for both tokens
-            # If orderbook is a single orderbook, we can't do arbitrage analysis
-            if isinstance(orderbook, dict) and "bids" in orderbook and "asks" in orderbook:
-                # Single orderbook - need to fetch the other one externally
-                # For now, just store what we have
-                return None
-
-            # If we have multi-orderbook format
-            if up_id not in orderbook or down_id not in orderbook:
-                return None
-
-            up_book = orderbook[up_id]
-            down_book = orderbook[down_id]
-
-            # Get best ask prices (cost to buy)
-            up_asks = up_book.get("asks", [])
-            down_asks = down_book.get("asks", [])
-
-            if not up_asks or not down_asks:
-                return None
-
-            up_price = float(up_asks[0]["price"])
-            down_price = float(down_asks[0]["price"])
-
-            # Update current market info for dashboard
-            self.current_market_info = {
-                "question": market.get("question", ""),
-                "condition_id": market.get("condition_id", ""),
-                "up_token_id": up_id,
-                "down_token_id": down_id,
-                "up_price": up_price,
-                "down_price": down_price,
-                "total_cost": up_price + down_price,
-                "timestamp": datetime.now().isoformat()
-            }
-
-            # Check for arbitrage opportunity
-            is_opportunity, spread, profit_pct = self._calculate_arbitrage_opportunity(
-                up_price, down_price
-            )
-
-            if is_opportunity:
-                logger.info(
-                    f"BTC Arbitrage opportunity found! "
-                    f"UP: {up_price:.3f}, DOWN: {down_price:.3f}, "
-                    f"Spread: {spread:.3f}, Profit: {profit_pct:.1f}%"
-                )
-
-                # Return signal to buy the cheaper side first
-                # The bot should then also buy the other side
-                if up_price <= down_price:
-                    return TradeSignal(
-                        signal=Signal.BUY,
-                        token_id=up_id,
-                        market_id=market.get("condition_id", ""),
-                        price=up_price,
-                        confidence=min(profit_pct / 10, 1.0),
-                        reason=f"BTC Arbitrage: UP @ {up_price:.3f}, DOWN @ {down_price:.3f}, profit {profit_pct:.1f}%",
-                        amount=self.max_position_per_side
-                    )
-                else:
-                    return TradeSignal(
-                        signal=Signal.BUY,
-                        token_id=down_id,
-                        market_id=market.get("condition_id", ""),
-                        price=down_price,
-                        confidence=min(profit_pct / 10, 1.0),
-                        reason=f"BTC Arbitrage: DOWN @ {down_price:.3f}, UP @ {up_price:.3f}, profit {profit_pct:.1f}%",
-                        amount=self.max_position_per_side
-                    )
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Error in BTC arbitrage analysis: {e}")
-            return None
+        """Standard analyze method (not used for this strategy)."""
+        return None
 
     def analyze_with_client(self, market: Dict[str, Any], client) -> List[TradeSignal]:
         """
-        Analyze a market using the client to fetch both orderbooks.
-        Returns signals for both UP and DOWN if arbitrage is found.
+        Analyze market for sequential arbitrage.
+
+        Returns a signal based on current state:
+        - If waiting: Look for good entry on first side
+        - If holding_first: Check if we can complete arbitrage with profit
         """
         if not self.is_active:
             return []
@@ -263,6 +158,7 @@ class BTCArbitrageStrategy(BaseStrategy):
             up_token, down_token = tokens
             up_id = up_token.get("token_id")
             down_id = down_token.get("token_id")
+            market_id = market.get("condition_id", "")
 
             # Fetch both orderbooks
             up_book = client.get_orderbook(up_id)
@@ -279,62 +175,224 @@ class BTCArbitrageStrategy(BaseStrategy):
 
             up_price = float(up_asks[0]["price"])
             down_price = float(down_asks[0]["price"])
+            total_cost = up_price + down_price
 
             # Update dashboard info
             self.current_market_info = {
                 "question": market.get("question", ""),
-                "condition_id": market.get("condition_id", ""),
+                "condition_id": market_id,
                 "up_token_id": up_id,
                 "down_token_id": down_id,
                 "up_price": up_price,
                 "down_price": down_price,
-                "total_cost": up_price + down_price,
+                "total_cost": total_cost,
+                "state": self.state,
+                "first_position": self.first_position,
+                "potential_profit": None,
                 "timestamp": datetime.now().isoformat()
             }
 
-            # Check arbitrage
-            is_opportunity, spread, profit_pct = self._calculate_arbitrage_opportunity(
-                up_price, down_price
-            )
+            # === STATE MACHINE ===
 
-            if is_opportunity:
-                logger.info(
-                    f"BTC Arbitrage: UP={up_price:.3f} + DOWN={down_price:.3f} = "
-                    f"{up_price + down_price:.3f}, profit={profit_pct:.1f}%"
+            if self.state == "waiting":
+                # Look for good entry on the cheaper side
+                return self._analyze_first_buy(
+                    market_id, up_id, down_id, up_price, down_price
                 )
 
-                signals = []
-                confidence = min(profit_pct / 10, 1.0)
-
-                # Buy UP
-                signals.append(TradeSignal(
-                    signal=Signal.BUY,
-                    token_id=up_id,
-                    market_id=market.get("condition_id", ""),
-                    price=up_price,
-                    confidence=confidence,
-                    reason=f"BTC Arb UP: {profit_pct:.1f}% profit",
-                    amount=self.max_position_per_side
-                ))
-
-                # Buy DOWN
-                signals.append(TradeSignal(
-                    signal=Signal.BUY,
-                    token_id=down_id,
-                    market_id=market.get("condition_id", ""),
-                    price=down_price,
-                    confidence=confidence,
-                    reason=f"BTC Arb DOWN: {profit_pct:.1f}% profit",
-                    amount=self.max_position_per_side
-                ))
-
-                return signals
+            elif self.state == "holding_first":
+                # Check if we can complete arbitrage
+                return self._analyze_second_buy(
+                    market_id, up_id, down_id, up_price, down_price
+                )
 
             return []
 
         except Exception as e:
-            logger.error(f"Error analyzing BTC market: {e}")
+            logger.error(f"Error in BTC sequential arbitrage: {e}")
             return []
+
+    def _analyze_first_buy(
+        self,
+        market_id: str,
+        up_id: str,
+        down_id: str,
+        up_price: float,
+        down_price: float
+    ) -> List[TradeSignal]:
+        """Analyze for first buy opportunity."""
+
+        # Buy the cheaper side if price is below threshold
+        if up_price <= down_price and up_price <= self.initial_buy_threshold:
+            logger.info(
+                f"[Step 1] Good entry for UP @ {up_price:.3f} "
+                f"(threshold: {self.initial_buy_threshold})"
+            )
+
+            return [TradeSignal(
+                signal=Signal.BUY,
+                token_id=up_id,
+                market_id=market_id,
+                price=up_price,
+                confidence=0.8,
+                reason=f"BTC Arb Step 1: Buy UP @ {up_price:.3f}",
+                amount=self.max_position_per_side
+            )]
+
+        elif down_price < up_price and down_price <= self.initial_buy_threshold:
+            logger.info(
+                f"[Step 1] Good entry for DOWN @ {down_price:.3f} "
+                f"(threshold: {self.initial_buy_threshold})"
+            )
+
+            return [TradeSignal(
+                signal=Signal.BUY,
+                token_id=down_id,
+                market_id=market_id,
+                price=down_price,
+                confidence=0.8,
+                reason=f"BTC Arb Step 1: Buy DOWN @ {down_price:.3f}",
+                amount=self.max_position_per_side
+            )]
+
+        logger.debug(
+            f"Waiting for better entry... UP={up_price:.3f}, DOWN={down_price:.3f}, "
+            f"threshold={self.initial_buy_threshold}"
+        )
+        return []
+
+    def _analyze_second_buy(
+        self,
+        market_id: str,
+        up_id: str,
+        down_id: str,
+        up_price: float,
+        down_price: float
+    ) -> List[TradeSignal]:
+        """Analyze for second buy to complete arbitrage."""
+
+        if not self.first_position:
+            logger.warning("State is holding_first but no position found, resetting")
+            self.state = "waiting"
+            self._save_state()
+            return []
+
+        first_side = self.first_position["side"]
+        first_price = self.first_position["price"]
+
+        # Determine second side price
+        if first_side == "UP":
+            second_side = "DOWN"
+            second_token_id = down_id
+            second_price = down_price
+        else:
+            second_side = "UP"
+            second_token_id = up_id
+            second_price = up_price
+
+        # Calculate potential profit
+        total_cost = first_price + second_price
+        potential_profit = 1 - total_cost
+        profit_pct = (potential_profit / total_cost) * 100 if total_cost > 0 else 0
+
+        # Update dashboard
+        if self.current_market_info:
+            self.current_market_info["potential_profit"] = profit_pct
+            self.current_market_info["first_side"] = first_side
+            self.current_market_info["first_price"] = first_price
+
+        logger.info(
+            f"[Step 2] Checking... First: {first_side} @ {first_price:.3f}, "
+            f"Second: {second_side} @ {second_price:.3f}, "
+            f"Total: {total_cost:.3f}, Profit: {profit_pct:.1f}%"
+        )
+
+        # Check if profit target is reached
+        if potential_profit >= self.target_profit:
+            logger.success(
+                f"[Step 2] ARBITRAGE COMPLETE! "
+                f"Total cost: {total_cost:.3f}, Profit: {profit_pct:.1f}%"
+            )
+
+            return [TradeSignal(
+                signal=Signal.BUY,
+                token_id=second_token_id,
+                market_id=market_id,
+                price=second_price,
+                confidence=1.0,
+                reason=f"BTC Arb Step 2: Buy {second_side} @ {second_price:.3f}, LOCK {profit_pct:.1f}% profit!",
+                amount=self.max_position_per_side
+            )]
+
+        logger.debug(
+            f"Waiting for {self.target_profit*100:.0f}% profit... "
+            f"Current: {profit_pct:.1f}%"
+        )
+        return []
+
+    def on_trade_executed(self, trade: Dict):
+        """
+        Called when a trade is executed. Updates strategy state.
+
+        Args:
+            trade: Trade details {type, token_id, price, amount, ...}
+        """
+        if trade.get("type") != "BUY":
+            return
+
+        token_id = trade.get("token_id", "")
+        price = trade.get("price", 0)
+
+        # Check if this is our market
+        if not self.current_market_info:
+            return
+
+        up_id = self.current_market_info.get("up_token_id", "")
+        down_id = self.current_market_info.get("down_token_id", "")
+
+        if token_id not in [up_id, down_id]:
+            return
+
+        if self.state == "waiting":
+            # First buy executed
+            side = "UP" if token_id == up_id else "DOWN"
+            self.first_position = {
+                "side": side,
+                "token_id": token_id,
+                "price": price,
+                "amount": trade.get("amount", 0),
+                "time": datetime.now().isoformat()
+            }
+            self.state = "holding_first"
+            self._save_state()
+
+            logger.success(f"[State] First position recorded: {side} @ {price:.3f}")
+
+        elif self.state == "holding_first":
+            # Second buy executed - arbitrage complete!
+            self.state = "completed"
+            self._save_state()
+
+            first_price = self.first_position["price"] if self.first_position else 0
+            total_cost = first_price + price
+            profit_pct = ((1 - total_cost) / total_cost) * 100
+
+            logger.success(
+                f"[State] ARBITRAGE COMPLETED! "
+                f"Total invested: ${total_cost:.3f}, Guaranteed profit: {profit_pct:.1f}%"
+            )
+
+            # Reset for next round after a delay
+            self.state = "waiting"
+            self.first_position = None
+            self._save_state()
+
+    def reset(self):
+        """Reset strategy state to start fresh."""
+        self.state = "waiting"
+        self.first_position = None
+        self._save_state()
+        logger.info("BTC Arbitrage strategy reset to initial state")
 
     def get_btc_market_info(self) -> Optional[Dict]:
         """Get current BTC market info for dashboard."""
@@ -344,11 +402,12 @@ class BTCArbitrageStrategy(BaseStrategy):
         """Get strategy statistics."""
         return {
             "name": self.name,
-            "min_spread": self.min_spread,
+            "state": self.state,
+            "target_profit": f"{self.target_profit*100:.0f}%",
             "max_position_per_side": self.max_position_per_side,
             "target_timeframe": self.target_timeframe,
-            "btc_markets_found": len(self.btc_markets),
-            "current_opportunity": self.current_market_info is not None,
+            "initial_buy_threshold": self.initial_buy_threshold,
+            "first_position": self.first_position,
             "is_active": self.is_active
         }
 

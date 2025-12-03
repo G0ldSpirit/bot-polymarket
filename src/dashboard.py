@@ -198,27 +198,51 @@ class Dashboard:
         from .strategies.btc_arbitrage import btc_arbitrage_strategy
 
         info = btc_arbitrage_strategy.get_btc_market_info()
+        stats = btc_arbitrage_strategy.get_stats()
 
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column("Label", style="cyan")
         table.add_column("Value", justify="right")
 
+        # Show current state
+        state = stats.get("state", "waiting")
+        state_colors = {"waiting": "yellow", "holding_first": "blue", "completed": "green"}
+        state_labels = {"waiting": "Waiting...", "holding_first": "Holding 1st", "completed": "Done!"}
+        state_color = state_colors.get(state, "white")
+        state_label = state_labels.get(state, state)
+        table.add_row("State", f"[{state_color}]{state_label}[/{state_color}]")
+
         if info:
-            table.add_row("Market", info.get("question", "N/A")[:30])
             table.add_row("UP Price", f"[green]${info.get('up_price', 0):.3f}[/green]")
             table.add_row("DOWN Price", f"[red]${info.get('down_price', 0):.3f}[/red]")
 
-            total = info.get('up_price', 0) + info.get('down_price', 0)
-            spread = 1 - total
-            spread_color = "green" if spread > 0 else "red"
+            # If holding first position, show details
+            first_pos = stats.get("first_position")
+            if first_pos and state == "holding_first":
+                first_side = first_pos.get("side", "")
+                first_price = first_pos.get("price", 0)
+                table.add_row("1st Position", f"[cyan]{first_side} @ ${first_price:.3f}[/cyan]")
 
-            table.add_row("Total Cost", f"${total:.3f}")
-            table.add_row("Spread", f"[{spread_color}]{spread:+.3f}[/{spread_color}]")
-            table.add_row("Potential Profit", f"[{spread_color}]{spread*100:+.1f}%[/{spread_color}]")
+                # Calculate potential profit if we buy second now
+                up_price = info.get('up_price', 0)
+                down_price = info.get('down_price', 0)
+                second_price = down_price if first_side == "UP" else up_price
+                total_cost = first_price + second_price
+                potential_profit = ((1 - total_cost) / total_cost) * 100 if total_cost > 0 else 0
+
+                profit_color = "green" if potential_profit >= 5 else "yellow" if potential_profit > 0 else "red"
+                table.add_row("If Buy Now", f"[{profit_color}]{potential_profit:+.1f}%[/{profit_color}]")
+                table.add_row("Target", f"[dim]{stats.get('target_profit', '5%')}[/dim]")
+            else:
+                total = info.get('up_price', 0) + info.get('down_price', 0)
+                spread = 1 - total
+                spread_color = "green" if spread > 0 else "red"
+                table.add_row("Total", f"${total:.3f}")
+                table.add_row("Spread", f"[{spread_color}]{spread*100:+.1f}%[/{spread_color}]")
         else:
             table.add_row("[dim]Searching for BTC markets...[/dim]", "")
 
-        return Panel(table, title="[bold]₿ BTC 1H Market[/bold]", border_style="orange1")
+        return Panel(table, title="[bold]₿ BTC Sequential Arb[/bold]", border_style="orange1")
 
     def _create_layout(self) -> Layout:
         """Create the dashboard layout."""

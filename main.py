@@ -94,22 +94,26 @@ def start(momentum: bool, arbitrage: bool, value: bool):
 
 
 @cli.command()
-@click.option("--min-spread", default=0.02, help="Minimum spread to trigger trade (e.g., 0.02 = 2%)")
+@click.option("--target-profit", default=0.05, help="Target profit to complete arbitrage (e.g., 0.05 = 5%)")
 @click.option("--amount", default=50.0, help="Amount in USDC per side (UP and DOWN)")
 @click.option("--timeframe", default="1h", type=click.Choice(["1h", "4h", "24h"]), help="Target timeframe")
+@click.option("--entry-threshold", default=0.55, help="Max price for first buy (e.g., 0.55 = 55 cents)")
 @click.option("--dashboard/--no-dashboard", default=True, help="Show live dashboard")
-def btc(min_spread: float, amount: float, timeframe: str, dashboard: bool):
+def btc(target_profit: float, amount: float, timeframe: str, entry_threshold: float, dashboard: bool):
     """
-    Start BTC arbitrage bot.
+    Start BTC sequential arbitrage bot.
 
-    This mode focuses on Bitcoin price prediction markets.
-    It buys both UP and DOWN positions when arbitrage opportunity exists.
+    Strategy:
+    1. First, buy UP (or DOWN) when price is below entry threshold
+    2. Wait for prices to move
+    3. When profit target is reached, buy the other side to lock in arbitrage
     """
     setup_logging(quiet=dashboard)
 
     console.print(Panel.fit(
-        "[bold orange1]BTC Arbitrage Bot[/bold orange1]\n"
-        f"Timeframe: {timeframe} | Min Spread: {min_spread*100:.1f}% | Amount: ${amount}/side",
+        "[bold orange1]BTC Sequential Arbitrage Bot[/bold orange1]\n"
+        f"Timeframe: {timeframe} | Target Profit: {target_profit*100:.0f}% | Amount: ${amount}/side\n"
+        f"Entry Threshold: ${entry_threshold:.2f}",
         border_style="orange1"
     ))
 
@@ -120,9 +124,10 @@ def btc(min_spread: float, amount: float, timeframe: str, dashboard: bool):
 
     # Add BTC arbitrage strategy
     btc_strategy = BTCArbitrageStrategy(
-        min_spread=min_spread,
+        target_profit=target_profit,
         max_position_per_side=amount,
-        target_timeframe=timeframe
+        target_timeframe=timeframe,
+        initial_buy_threshold=entry_threshold
     )
     trading_bot.add_strategy(btc_strategy)
 
@@ -130,6 +135,12 @@ def btc(min_spread: float, amount: float, timeframe: str, dashboard: bool):
     status = trading_bot.get_status()
     console.print(f"\n[cyan]Balance:[/cyan] ${status['balance']:.2f}" if status['balance'] else "")
     console.print(f"[cyan]Dry Run:[/cyan] {'Yes' if status['dry_run'] else 'No'}")
+
+    # Show strategy state
+    strat_stats = btc_strategy.get_stats()
+    if strat_stats.get("state") == "holding_first":
+        first_pos = strat_stats.get("first_position", {})
+        console.print(f"[cyan]Current Position:[/cyan] {first_pos.get('side')} @ ${first_pos.get('price', 0):.3f}")
 
     if status['dry_run']:
         console.print("\n[yellow]Running in DRY RUN mode - no real trades will be executed[/yellow]")
